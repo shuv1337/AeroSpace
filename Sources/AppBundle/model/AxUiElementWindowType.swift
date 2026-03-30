@@ -111,12 +111,25 @@ extension AxUiElementMock {
             return false
         }
 
-        // Just don't do anything with "Ghostty Quick Terminal" windows.
-        // Its position and size are managed by the Ghostty itself
+        // Just don't do anything with certain Ghostty pseudo/transient windows.
+        // Their position/size are managed by Ghostty itself or they are transient AX artifacts.
         // https://github.com/nikitabobko/AeroSpace/issues/103
         // https://github.com/ghostty-org/ghostty/discussions/3512
-        if id == .ghostty && get(Ax.identifierAttr) == "com.mitchellh.ghostty.quickTerminal" {
-            return false
+        if id == .ghostty {
+            if get(Ax.identifierAttr) == "com.mitchellh.ghostty.quickTerminal" {
+                return false
+            }
+            // Ghostty tab open can briefly expose a transient AX window that reuses
+            // the same identifier as regular windows, so the identifier alone is not
+            // enough. The stable dump signature is: restoration identifier + empty
+            // title + no document + not the app's focused window.
+            if get(Ax.identifierAttr) == "TerminalWindowRestoration" &&
+                (get(Ax.titleAttr) ?? "").isEmpty &&
+                get(Ax.documentAttr) == nil &&
+                axApp.get(Ax.focusedWindowAttr)?.windowId != self.containingWindowId()
+            {
+                return false
+            }
         }
 
         lazy var fullscreenButton = get(Ax.fullscreenButtonAttr)

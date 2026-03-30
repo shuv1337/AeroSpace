@@ -119,7 +119,11 @@ private func refresh() async throws {
         }
     }
     for (app, windowIds) in mapping {
+        app.pruneDeferredNewWindowRegistration(aliveWindowIds: windowIds)
         for windowId in windowIds {
+            if app.shouldDeferNewWindowRegistration(windowId) {
+                continue
+            }
             try await MacWindow.getOrRegister(windowId: windowId, macApp: app)
         }
     }

@@ -195,6 +195,10 @@ enum Ax {
         key: kAXIdentifierAttribute,
         getter: { $0 as? String },
     )
+    static let documentAttr = ReadableAttrImpl<String>(
+        key: kAXDocumentAttribute,
+        getter: { $0 as? String },
+    )
     // static let modalAttr = ReadableAttrImpl<Bool>(
     //     key: kAXModalAttribute,
     //     getter: { $0 as? Bool },

@@ -17,6 +17,7 @@ final class MacApp: AbstractApp {
     private var thread: Thread?
     private var setFrameJobs: [UInt32: RunLoopJob] = [:]
     @MainActor private static var focusJob: RunLoopJob? = nil
+    @MainActor private var deferredNewGhosttyWindows: [UInt32: Date] = [:]
 
     /*conforms*/ var name: String? { nsApp.localizedName }
     /*conforms*/ var execPath: String? { nsApp.executableURL?.path }
@@ -134,6 +135,9 @@ final class MacApp: AbstractApp {
     func setAxFrame(_ windowId: UInt32, _ topLeft: CGPoint?, _ size: CGSize?) {
         setFrameJobs.removeValue(forKey: windowId)?.cancel()
         setFrameJobs[windowId] = withWindowAsync(windowId) { [axApp] window, job in
+            if try shouldSkipSetFrame(window, topLeft, size, job) {
+                return
+            }
             try disableAnimations(app: axApp.threadGuarded, job) {
                 try setFrame(window, topLeft, size, job)
             }
@@ -143,6 +147,9 @@ final class MacApp: AbstractApp {
     func setAxFrameBlocking(_ windowId: UInt32, _ topLeft: CGPoint?, _ size: CGSize?) async throws {
         setFrameJobs.removeValue(forKey: windowId)?.cancel()
         try await withWindow(windowId) { [axApp] window, job in
+            if try shouldSkipSetFrame(window, topLeft, size, job) {
+                return
+            }
             try disableAnimations(app: axApp.threadGuarded, job) {
                 try setFrame(window, topLeft, size, job)
             }
@@ -226,6 +233,31 @@ final class MacApp: AbstractApp {
     }
 
     @MainActor
+    func shouldDeferNewWindowRegistration(_ windowId: UInt32) -> Bool {
+        guard appId == .ghostty else { return false }
+        guard MacWindow.get(byId: windowId) == nil else {
+            deferredNewGhosttyWindows.removeValue(forKey: windowId)
+            return false
+        }
+        let now = Date()
+        if let firstSeenAt = deferredNewGhosttyWindows[windowId] {
+            if now.timeIntervalSince(firstSeenAt) < 0.2 {
+                return true
+            }
+            deferredNewGhosttyWindows.removeValue(forKey: windowId)
+            return false
+        }
+        deferredNewGhosttyWindows[windowId] = now
+        return true
+    }
+
+    @MainActor
+    func pruneDeferredNewWindowRegistration(aliveWindowIds: [UInt32]) {
+        let alive = aliveWindowIds.toSet()
+        deferredNewGhosttyWindows = deferredNewGhosttyWindows.filter { alive.contains($0.key) }
+    }
+
+    @MainActor
     static func refreshAllAndGetAliveWindowIds(frontmostAppBundleId: String?) async throws -> [MacApp: [UInt32]] {
         for (_, app) in MacApp.allAppsMap { // gc dead apps
             try checkCancellation()
@@ -273,24 +305,39 @@ final class MacApp: AbstractApp {
         }
         guard let thread else { return [] }
         let (alive, dead) = try await thread.runInLoop { [nsApp, windows, axApp] (job) -> ([UInt32], [UInt32]) in
-            var alive: [UInt32: AxWindow] = windows.threadGuarded
-            var dead = [UInt32: AxWindow]()
+            let previouslyAlive = windows.threadGuarded
             // Second line of defence against lock screen. See the first line of defence: closedWindowsCache
             // Second and third lines of defence are technically needed only to avoid potential flickering
-            if frontmostAppBundleId != lockScreenAppBundleId {
-                (alive, dead) = try alive.partition {
-                    try job.checkCancellation()
-                    return $0.value.ax.containingWindowId() != nil
-                }
+            if frontmostAppBundleId == lockScreenAppBundleId {
+                return (Array(previouslyAlive.keys), [])
             }
+
+            var alive: [UInt32: AxWindow] = [:]
+            var listedWindowIds: Set<UInt32> = []
 
             for (id, window) in axApp.threadGuarded.get(Ax.windowsAttr) ?? [] {
                 try job.checkCancellation()
-                try alive.getOrRegisterAxWindow(windowId: id, window, nsApp, job)
+                listedWindowIds.insert(id)
+                if let existing = previouslyAlive[id] {
+                    alive[id] = existing
+                } else {
+                    try alive.getOrRegisterAxWindow(windowId: id, window, nsApp, job)
+                }
             }
 
+            if let focused = axApp.threadGuarded.get(Ax.focusedWindowAttr), !listedWindowIds.contains(focused.windowId) {
+                try job.checkCancellation()
+                listedWindowIds.insert(focused.windowId)
+                if let existing = previouslyAlive[focused.windowId] {
+                    alive[focused.windowId] = existing
+                } else {
+                    try alive.getOrRegisterAxWindow(windowId: focused.windowId, focused.ax.cast, nsApp, job)
+                }
+            }
+
+            let dead = previouslyAlive.keys.filter { !listedWindowIds.contains($0) }
             windows.threadGuarded = alive
-            return (Array(alive.keys), Array(dead.keys))
+            return (Array(alive.keys), Array(dead))
         }
         windowsCount = alive.count
         for windowId in dead {
@@ -369,6 +416,33 @@ extension [UInt32: AxWindow] {
             return nil
         }
     }
+}
+
+private let setFrameEpsilon: CGFloat = 1
+
+private func approxEqual(_ lhs: CGFloat, _ rhs: CGFloat, epsilon: CGFloat = setFrameEpsilon) -> Bool {
+    abs(lhs - rhs) <= epsilon
+}
+
+private func shouldSkipSetFrame(_ window: AXUIElement, _ topLeft: CGPoint?, _ size: CGSize?, _ job: RunLoopJob) throws -> Bool {
+    if topLeft == nil && size == nil { return true }
+
+    if let topLeft {
+        guard let currentTopLeft = window.get(Ax.topLeftCornerAttr) else { return false }
+        if !approxEqual(currentTopLeft.x, topLeft.x) || !approxEqual(currentTopLeft.y, topLeft.y) {
+            return false
+        }
+    }
+    try job.checkCancellation()
+
+    if let size {
+        guard let currentSize = window.get(Ax.sizeAttr) else { return false }
+        if !approxEqual(currentSize.width, size.width) || !approxEqual(currentSize.height, size.height) {
+            return false
+        }
+    }
+
+    return true
 }
 
 private func setFrame(_ window: AXUIElement, _ topLeft: CGPoint?, _ size: CGSize?, _ job: RunLoopJob) throws {
